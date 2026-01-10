@@ -113,30 +113,39 @@ def main() -> int:
         )
         return 2
 
+    devices_by_id = {d.id: d for d in jax.devices()}
     engines: list[Engine] = []
     try:
         for i, device_id in enumerate(device_indexes):
             print(f"[engine {i}] init device_indexes={[device_id]}", flush=True)
-            engine = Engine(
-                model_path=args.model,
-                trust_remote_code=True,
-                tp_size=1,
-                device="tpu",
-                device_indexes=[device_id],
-                enable_single_process=True,
-                disable_overlap_schedule=True,
-                disable_precompile=True,
-                load_format=args.load_format,
-                context_length=args.context_length,
-                max_total_tokens=args.max_total_tokens,
-                max_prefill_tokens=args.max_prefill_tokens,
-                page_size=args.page_size,
-                max_running_requests=args.max_running_requests,
-                mem_fraction_static=args.mem_fraction_static,
-                download_dir="/tmp",
-                dtype="bfloat16",
-                skip_server_warmup=True,
-            )
+            default_device = devices_by_id.get(device_id)
+            if default_device is None:
+                raise ValueError(f"Unknown device id {device_id}. Known: {sorted(devices_by_id)}")
+
+            # Some sglang-jax initialization paths create unsharded arrays on
+            # `jax.devices()[0]`. Force the default device during initialization
+            # so each Engine's internal state lands on its intended TPU core.
+            with jax.default_device(default_device):
+                engine = Engine(
+                    model_path=args.model,
+                    trust_remote_code=True,
+                    tp_size=1,
+                    device="tpu",
+                    device_indexes=[device_id],
+                    enable_single_process=True,
+                    disable_overlap_schedule=True,
+                    disable_precompile=True,
+                    load_format=args.load_format,
+                    context_length=args.context_length,
+                    max_total_tokens=args.max_total_tokens,
+                    max_prefill_tokens=args.max_prefill_tokens,
+                    page_size=args.page_size,
+                    max_running_requests=args.max_running_requests,
+                    mem_fraction_static=args.mem_fraction_static,
+                    download_dir="/tmp",
+                    dtype="bfloat16",
+                    skip_server_warmup=True,
+                )
             scheduler = engine.scheduler_info.get("scheduler")
             mesh = getattr(scheduler, "mesh", None)
             mesh_device_ids = None
@@ -183,4 +192,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
