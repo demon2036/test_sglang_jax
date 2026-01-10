@@ -121,6 +121,60 @@ def _patch_tunix_sglang_jax_engine_args(
     sglang_jax_sampler_lib.SglangJaxSampler._sglang_jax_config = patched_fn
 
 
+def _patch_tunix_shard_input_for_multihost():
+    """Monkeypatch Tunix's shard_input to support multi-controller JAX.
+
+    Tunix's `tunix.sft.sharding_utils.shard_input` uses
+    `jax.make_array_from_process_local_data(...)` for all leaves. In multi-host
+    (multi-controller) JAX, some leaves can be global `jax.Array`s that are not
+    fully addressable, and feeding them back into `make_array_from_process_local_data`
+    triggers `device_put` addressability errors.
+
+    This patch keeps the original fast path for host-local numpy inputs, but
+    reshard global `jax.Array` leaves via `jax.device_put(...)`.
+    """
+    from tunix.sft import sharding_utils as sharding_utils_lib
+
+    import jax
+    from jax.interpreters import pxla
+    import jax.sharding as shd
+
+    original_fn = sharding_utils_lib.shard_input
+
+    def patched_fn(input_data, data_sharding_axis):
+        mesh = pxla.thread_resources.env.physical_mesh
+        if mesh.empty:
+            return input_data
+
+        pspec = shd.PartitionSpec(*data_sharding_axis)
+
+        def _already_sharded(x):
+            return (
+                isinstance(x, jax.Array)
+                and hasattr(x, "sharding")
+                and hasattr(x.sharding, "mesh")
+                and x.sharding.mesh == mesh
+                and hasattr(x.sharding, "spec")
+                and x.sharding.spec == pspec
+            )
+
+        is_sharded = jax.tree.map(_already_sharded, input_data)
+        if all(jax.tree.leaves(is_sharded)):
+            return input_data
+
+        def _reshard_leaf(x):
+            target_sharding = sharding_utils_lib.get_sharding(x, mesh=mesh, pspec=pspec)
+            if isinstance(x, jax.Array):
+                return jax.device_put(x, target_sharding)
+            return jax.make_array_from_process_local_data(target_sharding, x)
+
+        with jax.transfer_guard("allow"):
+            return jax.tree.map(_reshard_leaf, input_data)
+
+    sharding_utils_lib.shard_input = patched_fn
+    return original_fn
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -214,6 +268,7 @@ def main() -> int:
         max_prefill_tokens=max_prefill_tokens,
         max_running_requests=max_running_requests,
     )
+    _patch_tunix_shard_input_for_multihost()
 
     naming_info = naming.ModelNaming(model_id=args.model_id)
     model_name = naming_info.model_name
