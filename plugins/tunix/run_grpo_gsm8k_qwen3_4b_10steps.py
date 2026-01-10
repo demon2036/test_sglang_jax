@@ -111,11 +111,17 @@ def _patch_tunix_sglang_jax_engine_args(
     original_fn = sglang_jax_sampler_lib.SglangJaxSampler._sglang_jax_config
 
     def patched_fn(self, config):
+        import jax
+
         engine_args = original_fn(self, config)
         engine_args["disable_precompile"] = disable_precompile
         engine_args["max_total_tokens"] = max_total_tokens
         engine_args["max_prefill_tokens"] = max_prefill_tokens
         engine_args["max_running_requests"] = max_running_requests
+        # Multi-host JAX + sglang-jax overlap threads can trigger TPU runtime
+        # failures (program continuator halted). Prefer the non-overlap path.
+        if jax.process_count() > 1:
+            engine_args["disable_overlap_schedule"] = True
         return engine_args
 
     sglang_jax_sampler_lib.SglangJaxSampler._sglang_jax_config = patched_fn
