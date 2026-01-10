@@ -13,6 +13,7 @@
     - Low-friction: keep rollout policy stale for a while, then restart servers on new checkpoints (jit cache reduces recompilation cost).
     - Faster hot-swap: train as LoRA and pass `lora_path` per request (engine supports per-request LoRA).
   - If you must use a **single multi-host slice** (e.g., `v4-32`) and still want `tp=8` replicas: current `sglang-jax` does not implement `--dp-size > 1` (engine code has `pass`), so you cannot reliably run 4 independent engines inside one slice; either re-provision as multiple `v4-8`, or run one engine with `--tp-size <TOTAL_DEVICES>` on that slice.
+  - Observed: **in-process** sglang-jax rollouts inside a **multi-host** JAX program can crash with `FAILED_PRECONDITION: The program continuator has halted unexpectedly.` (see `docs/sops/tunix-integration.md`). Treat multi-host sglang-jax rollouts as **external service** for now.
   **Expected Result**: Rollout throughput scales ~linearly with number of `v4-8` replicas; TPU stays busy once request concurrency exceeds the engine's `max_running_requests`
   **Troubleshooting**:
   - If you try multiple engines on one TPU VM, the second engine typically fails with `The TPU is already in use by process ...` (libtpu multi-process lock).

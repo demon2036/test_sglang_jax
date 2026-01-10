@@ -1,5 +1,7 @@
 # TPU Tests SOPs
 
+## Unittest runs
+
 - **Title**: SOP: Sync `/home/john/test_sglang_jax/plugins` to TPU root + run Qwen3 chat template unittest
   **Prereqs**: Cloud TPU v4+; repos under `/root/`; conda env with JAX TPU + sglang-jax deps (e.g., `tunix`)
   **Steps**:
@@ -34,6 +36,8 @@
   **Troubleshooting**: If TPU is busy, run `lsof -w /dev/accel0`; if empty but still blocked, `rm -f /tmp/libtpu_lockfile`
   **References**: N/A
 
+## Mesh validation
+
 - **Title**: SOP: Verify device-indexes works for mesh (TPU)
   **Prereqs**: SSH into TPU VM as root; conda env `sglang-jax` installed; `sglang-jax` installed in env
   **Steps**:
@@ -42,6 +46,8 @@
   **Expected Result**: `mesh.devices` only contains `TpuDevice(id=0, ...)` and `mesh.shape` is `{'data': 1, 'tensor': 1}`
   **Troubleshooting**: If `device {self.device} is not consistent with 'JAX_PLATFORMS' ...`, unset `JAX_PLATFORMS` or set it to `tpu`
   **References**: `python/sgl_jax/srt/server_args.py` ; `python/sgl_jax/srt/utils/mesh_utils.py`
+
+## Concurrency behavior
 
 - **Title**: SOP: Test multi-engine concurrency on one TPU VM (Qwen3-4B)
   **Prereqs**: TPU VM `sglang-jax-spot-qwen14b-20260110-114742` in `us-central2-b`; repo at `/root/sglang-jax`; conda env `sglang-jax` (python 3.12 + jax 0.8.1); local helper script at `/home/john/test_sglang_jax/scripts/run_engine_once_qwen3_4b.py`
