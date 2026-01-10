@@ -12,11 +12,8 @@ import os
 import re
 
 import jax
-import jax.numpy as jnp
 from datasets import load_dataset
 from transformers import AutoTokenizer
-
-import easydel as ed
 
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 DEFAULT_DATASET_ID = "openai/gsm8k"
@@ -27,6 +24,73 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 ANSWER_RE = re.compile(r"####\s*(-?\d+(?:\.\d+)?)")
+
+
+def _env_truthy(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _coerce_int(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _guess_process_id() -> int | None:
+    for key in ("EASYDEL_JAX_PROCESS_ID", "JAX_PROCESS_ID", "JAX_PROCESS_INDEX", "PROCESS_ID"):
+        if (value := _coerce_int(os.environ.get(key))) is not None:
+            return value
+    for key in ("TPU_WORKER_ID", "WORKER_ID"):
+        if (value := _coerce_int(os.environ.get(key))) is not None:
+            return value
+    hostname = os.uname().nodename
+    for pattern in (r"-w-(\d+)$", r"-worker-(\d+)$"):
+        match = re.search(pattern, hostname)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _guess_process_count() -> int | None:
+    for key in ("EASYDEL_JAX_PROCESS_COUNT", "JAX_PROCESS_COUNT", "NUM_PROCESSES", "TPU_WORKER_COUNT"):
+        if (value := _coerce_int(os.environ.get(key))) is not None:
+            return value
+    return None
+
+
+def _maybe_initialize_jax_distributed() -> None:
+    coordinator = os.environ.get("EASYDEL_JAX_COORDINATOR_ADDRESS") or os.environ.get("JAX_COORDINATOR_ADDRESS")
+    local_device_ids = os.environ.get("EASYDEL_JAX_LOCAL_DEVICE_IDS") or os.environ.get("JAX_LOCAL_DEVICE_IDS")
+    num_processes = _guess_process_count()
+    process_id = _guess_process_id()
+    enabled = _env_truthy(os.environ.get("EASYDEL_JAX_DISTRIBUTED"))
+
+    if not enabled and coordinator is None and num_processes is None:
+        return
+
+    if coordinator is None or num_processes is None:
+        raise ValueError(
+            "JAX distributed requested but coordinator/process count is missing. "
+            "Set EASYDEL_JAX_COORDINATOR_ADDRESS and EASYDEL_JAX_PROCESS_COUNT."
+        )
+    if process_id is None:
+        raise ValueError(
+            "JAX distributed requested but process id could not be determined. "
+            "Set EASYDEL_JAX_PROCESS_ID (or TPU_WORKER_ID/hostname should encode it)."
+        )
+
+    jax.distributed.initialize(
+        coordinator_address=coordinator,
+        num_processes=num_processes,
+        process_id=process_id,
+        local_device_ids=[int(x) for x in local_device_ids.split(",")] if local_device_ids else None,
+    )
+    print(f"JAX distributed: process_index={jax.process_index()} process_count={jax.process_count()}")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -93,6 +157,11 @@ def main() -> None:
     os.environ.setdefault("JAX_PLATFORMS", "tpu")
     os.environ.setdefault("HF_HOME", "/root/.cache/huggingface")
     os.environ.setdefault("HF_DATASETS_CACHE", "/root/.cache/huggingface/datasets")
+
+    _maybe_initialize_jax_distributed()
+
+    import jax.numpy as jnp
+    import easydel as ed
 
     print(f"JAX backend: {jax.default_backend()}")
     print(f"Model: {args.model_id}")
@@ -165,6 +234,7 @@ def main() -> None:
         save_steps=None,
         save_optimizer_state=False,
         use_wandb=False,
+        use_esurge_generation=False,
         track_memory=False,
     )
 

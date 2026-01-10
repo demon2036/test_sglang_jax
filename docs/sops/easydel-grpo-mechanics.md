@@ -59,3 +59,21 @@
   - `easydel/easydel/trainers/group_relative_policy_optimization/grpo_trainer.py`
   - `easydel/tutorials/post-training/group_relative_policy_optimization/launch.py`
   - `easydel/docs/trainers/ray_distributed_trainer.md`
+
+- **Title**: SOP: Diagnose eSurge multi-host mismatch during GRPO rollouts
+  **Prereqs**: local repo at `/home/john/test_sglang_jax/easydel`; multi-host GRPO run that triggers eSurge device_put mismatch
+  **Steps**:
+  - `rg -n "req_num_tokens_full_buf|_empty_sharding|device_put" easydel/easydel/inference/esurge -g"*.py"`
+  - `sed -n '1100,1195p' easydel/easydel/inference/esurge/runners/model_runner.py`
+  - `rg -n "scheduler_thread|_scheduler_loop|async" easydel/easydel/inference/esurge/esurge_engine.py`
+  - `sed -n '680,850p' easydel/easydel/inference/esurge/esurge_engine.py`
+  - `rg -n "process_index\\(\\)|process_count\\(\\)|multihost" easydel/easydel/inference/esurge -g"*.py"`
+  **Expected Result**:
+  - `ModelRunner._execute_model_impl` uses `jax.device_put(req_num_tokens_np, self._empty_sharding)` where `_empty_sharding` is a fully replicated `NamedSharding`, so multi-host requires identical host arrays.
+  - eSurge scheduling runs per-process in a background thread (`esurge_engine.py`), with no multihost synchronization or `process_index` logic.
+  - Multi-host GRPO can hit `AssertionError` from `jax.experimental.multihost_utils.assert_equal` (array mismatch across processes), matching the error seen during rollout.
+  **Troubleshooting**:
+  - For multi-host GRPO, disable eSurge generation (`use_esurge_generation=False`) until eSurge adds cross-host synchronization.
+  **References**:
+  - `easydel/easydel/inference/esurge/runners/model_runner.py`
+  - `easydel/easydel/inference/esurge/esurge_engine.py`

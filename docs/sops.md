@@ -23,7 +23,7 @@ SOPs are grouped by area under `docs/sops/` for quick lookup.
 
 - `docs/sops/easydel-overrides.md`: EasyDeL non-invasive overrides
 - `docs/sops/easydel-grpo-mechanics.md`: GRPO rollout + scheduling internals
-- `docs/sops/easydel-training.md`: EasyDeL TPU install + GRPO smoke test
+- `docs/sops/easydel-training.md`: EasyDeL TPU install + GRPO smoke tests (single-host + multi-host)
 
 ## Tunix
 

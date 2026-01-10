@@ -76,6 +76,7 @@ def main() -> int:
     os.environ.setdefault("HF_DATASETS_CACHE", "/tmp/hf_datasets")
 
     import jax
+    from flax import nnx
     from sgl_jax.srt.entrypoints.engine import Engine
 
     local_devices = list(jax.local_devices())
@@ -116,6 +117,31 @@ def main() -> int:
     devices_by_id = {d.id: d for d in jax.devices()}
     engines: list[Engine] = []
     try:
+        def _get_model_runner(engine: Engine):
+            scheduler = engine.scheduler_info.get("scheduler")
+            if scheduler is None:
+                raise RuntimeError("engine.scheduler_info['scheduler'] is missing")
+            tp_worker = getattr(scheduler, "tp_worker", None)
+            if tp_worker is None:
+                raise RuntimeError("scheduler.tp_worker is missing")
+            worker = getattr(tp_worker, "worker", None)
+            if worker is not None and hasattr(worker, "model_runner"):
+                return worker.model_runner
+            if hasattr(tp_worker, "model_runner"):
+                return tp_worker.model_runner
+            raise RuntimeError("Unable to locate model_runner on tp_worker")
+
+        def _fix_sampler_state_to_engine_device(engine: Engine):
+            model_runner = _get_model_runner(engine)
+            target_device = model_runner.mesh.devices.reshape(-1)[0]
+            sampler_def, sampler_state = nnx.split(model_runner.sampler)
+            sampler_state = jax.tree.map(
+                lambda x: jax.device_put(x, target_device) if isinstance(x, jax.Array) else x,
+                sampler_state,
+            )
+            model_runner.sampler = nnx.merge(sampler_def, sampler_state)
+            model_runner.initialize_jit()
+
         for i, device_id in enumerate(device_indexes):
             print(f"[engine {i}] init device_indexes={[device_id]}", flush=True)
             default_device = devices_by_id.get(device_id)
@@ -155,6 +181,7 @@ def main() -> int:
                 f"[engine {i}] OK mesh_device_ids={mesh_device_ids} server_args.device_indexes={engine.server_args.device_indexes}",
                 flush=True,
             )
+            _fix_sampler_state_to_engine_device(engine)
             engines.append(engine)
 
         sampling_params = {"max_new_tokens": args.max_new_tokens, "temperature": 0}
