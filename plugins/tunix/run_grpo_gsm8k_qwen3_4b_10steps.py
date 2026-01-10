@@ -218,6 +218,13 @@ def main() -> int:
     parser.add_argument("--sglang-page-size", type=int, default=64)
     parser.add_argument("--sglang-mem-fraction-static", type=float, default=0.8)
     parser.add_argument(
+        "--rollout-engine",
+        type=str,
+        default="sglang_jax",
+        choices=["sglang_jax", "vanilla"],
+        help="Rollout backend. Note: in-process sglang-jax rollout is unstable on multi-host today; use vanilla there.",
+    )
+    parser.add_argument(
         "--rollout-devices",
         type=int,
         default=2,
@@ -248,6 +255,13 @@ def main() -> int:
 
     logging.set_verbosity(logging.INFO)
     logging.info("JAX devices: %s", jax.devices())
+    if jax.process_count() > 1 and args.rollout_engine == "sglang_jax":
+        logging.warning(
+            "Multi-host detected (process_count=%s) with rollout_engine=sglang_jax. "
+            "This mode is currently unstable with in-process sglang-jax; "
+            "prefer --rollout-engine vanilla or run sglang-jax as external single-host servers.",
+            jax.process_count(),
+        )
 
     if args.local_model_dir:
         local_model_dir = Path(args.local_model_dir).resolve()
@@ -421,7 +435,7 @@ def main() -> int:
             rl_cluster_lib.Role.REFERENCE: train_mesh,
             rl_cluster_lib.Role.ROLLOUT: rollout_mesh,
         },
-        rollout_engine="sglang_jax",
+        rollout_engine=args.rollout_engine,
         offload_to_cpu=False,
         training_config=training_config,
         rollout_config=rollout_config,
