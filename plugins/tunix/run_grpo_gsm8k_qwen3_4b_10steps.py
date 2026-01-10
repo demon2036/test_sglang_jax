@@ -165,6 +165,13 @@ def _patch_tunix_shard_input_for_multihost():
         def _reshard_leaf(x):
             target_sharding = sharding_utils_lib.get_sharding(x, mesh=mesh, pspec=pspec)
             if isinstance(x, jax.Array):
+                # `jax.device_put` resharding can hit edge-cases on TPU when the
+                # source is e.g. a `SingleDeviceSharding` array. Keep Tunix's
+                # original "treat as process-local data" path for fully
+                # addressable arrays, and only use `device_put` for global
+                # arrays that span multiple hosts.
+                if x.is_fully_addressable:
+                    return jax.make_array_from_process_local_data(target_sharding, x)
                 return jax.device_put(x, target_sharding)
             return jax.make_array_from_process_local_data(target_sharding, x)
 
