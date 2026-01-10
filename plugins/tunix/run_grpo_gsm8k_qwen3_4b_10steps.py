@@ -56,6 +56,44 @@ def _make_fsdp_tp_mesh(devices, fsdp: int, tp: int):
     )
 
 
+def _split_devices_for_rollout(all_devices, rollout_n: int):
+    """Split devices into (rollout_devices, train_devices).
+
+    On multi-host TPU, JAX requires running on all hosts. To avoid hanging due
+    to a mesh that only includes devices from a subset of hosts, we pick devices
+    for rollout in a round-robin over `process_index` when possible.
+    """
+    by_process: dict[int, list] = {}
+    for device in all_devices:
+        by_process.setdefault(device.process_index, []).append(device)
+
+    process_indices = sorted(by_process)
+    for devices in by_process.values():
+        devices.sort(key=lambda d: d.id)
+
+    rollout_devices = []
+    while len(rollout_devices) < rollout_n:
+        made_progress = False
+        for process_index in process_indices:
+            devices = by_process[process_index]
+            if devices:
+                rollout_devices.append(devices.pop(0))
+                made_progress = True
+                if len(rollout_devices) == rollout_n:
+                    break
+        if not made_progress:
+            break
+
+    train_devices = []
+    for process_index in process_indices:
+        train_devices.extend(by_process[process_index])
+
+    if not train_devices:
+        train_devices = list(all_devices)
+
+    return rollout_devices, train_devices
+
+
 def _patch_tunix_sglang_jax_engine_args(
     *,
     disable_precompile: bool,
@@ -151,8 +189,7 @@ def main() -> int:
         raise RuntimeError("No JAX devices found.")
 
     rollout_n = max(1, min(args.rollout_devices, len(all_devices)))
-    rollout_devices = all_devices[:rollout_n]
-    train_devices = all_devices[rollout_n:] or all_devices
+    rollout_devices, train_devices = _split_devices_for_rollout(all_devices, rollout_n)
 
     # Training/reference: shard across remaining devices (FSDP) to save memory.
     train_mesh = _make_fsdp_tp_mesh(train_devices, fsdp=len(train_devices), tp=1)
