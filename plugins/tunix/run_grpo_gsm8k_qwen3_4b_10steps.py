@@ -172,7 +172,13 @@ def _patch_tunix_shard_input_for_multihost():
                 # arrays that span multiple hosts.
                 if x.is_fully_addressable:
                     return jax.make_array_from_process_local_data(target_sharding, x)
-                return jax.device_put(x, target_sharding)
+                try:
+                    return jax.device_put(x, target_sharding)
+                except AssertionError:
+                    # JAX 0.8.1 can assert when resharding a global Array whose
+                    # source sharding is not a NamedSharding (e.g. PmapSharding).
+                    # Reshard through a jit identity instead.
+                    return jax.jit(lambda y: y, out_shardings=target_sharding)(x)
             return jax.make_array_from_process_local_data(target_sharding, x)
 
         with jax.transfer_guard("allow"):
