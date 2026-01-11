@@ -83,3 +83,16 @@
   **Expected Result**: PREEMPTED nodes are removed from `us-central2-b` listings
   **Troubleshooting**: If a delete fails, re-run the loop for the remaining node name(s)
   **References**: N/A
+
+- **Title**: SOP: Delete ALL TPU VMs in current gcloud project (all zones)
+  **Prereqs**: gcloud configured; project `civil-rarity-482610-s5`
+  **Steps**:
+  - Inventory all TPU VMs across zones:
+    - `gcloud compute tpus locations list --format='value(locationId)' | xargs -P6 -I{} bash -lc 'gcloud compute tpus tpu-vm list --zone="{}" --format="value(name,acceleratorType,state)" 2>/dev/null | awk -v zone="{}" '\''{print $1"\t"zone"\t"$2"\t"$3}'\''' | sort`
+  - Delete all TPU VMs across zones:
+    - `set -euo pipefail; gcloud compute tpus locations list --format='value(locationId)' | xargs -P6 -I{} bash -lc 'gcloud compute tpus tpu-vm list --zone="{}" --format="value(name,acceleratorType,state)" 2>/dev/null | awk -v zone="{}" '\''{print $1"\t"zone"\t"$2"\t"$3}'\''' | sort | while IFS=$'\t' read -r name zone accelerator state; do if [ -z "${name}" ]; then continue; fi; echo "Deleting TPU VM: ${name} (${accelerator}, ${state}) in ${zone}" >&2; gcloud compute tpus tpu-vm delete "${name}" --zone="${zone}" --quiet; done`
+  - Verify nothing remains:
+    - `gcloud compute tpus locations list --format='value(locationId)' | xargs -P6 -I{} bash -lc 'gcloud compute tpus tpu-vm list --zone="{}" --format="value(name)" 2>/dev/null' | sort`
+  **Expected Result**: The verify step prints no TPU names.
+  **Troubleshooting**: If `gcloud alpha ...` prompts to install components, prefer the `gcloud compute ...` commands above (no `alpha` component required).
+  **References**: N/A

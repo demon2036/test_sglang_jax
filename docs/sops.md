@@ -7,16 +7,21 @@ SOPs are grouped by area under `docs/sops/` for quick lookup.
 - `docs/sops/repo-setup.md`: cloning and repo verification
 - `docs/sops/network-checks.md`: network verification
 - `docs/sops/docs-maintenance.md`: AGENTS/docs updates
+- `docs/sops/git-worktrees.md`: work on multiple branches in parallel
+- `docs/sops/github-push.md`: commit and push workflow
 
 ## TPU VM lifecycle and runtime
 
 - `docs/sops/tpu-vm-lifecycle.md`: TPU VM discovery, SSH, provisioning, cleanup
+- `docs/sops/tpu-vm-delete-all.md`: delete all TPU VMs across locations
 - `docs/sops/tpu-vm-bootstrap.md`: conda + sglang-jax bootstrap on TPU VM
 - `docs/sops/tpu-vm-runtime.md`: runtime images and version mapping
 
 ## TPU validation and scaling
 
 - `docs/sops/tpu-tests.md`: TPU test runs, mesh checks, concurrency behavior
+- `docs/sops/sglang-jax-multi-engine-threads.md`: v4-8 single-process multi-engine thread attempt
+- `docs/sops/sglang-jax-openai-multi-server.md`: v4-8 single-process multi-server OpenAI validation
 - `docs/sops/scaling-rollouts.md`: rollout scaling guidance
 
 ## EasyDeL
