@@ -28,3 +28,30 @@
   - If the SSH command hangs after completion, re-run with `--force-exit` (already in the command above) to avoid lingering engine threads.
   - If requests return 422 for missing `request/raw_request`, ensure the plugin uses module-level FastAPI imports (needed with `from __future__ import annotations`).
   **References**: `plugins/sglang_jax/run_multi_openai_servers.py`
+
+- **Title**: SOP: Run 4 OpenAI-compatible servers (Windows PowerShell + OpenSSH, v5litepod-4 spot)
+  **Prereqs**: Windows PowerShell 5.1; OpenSSH client (`ssh`, `scp`); gcloud project `civil-rarity-482610-s5`; spot capacity for `v5litepod-4` in `europe-west4-b`; TPU VM runtime `tpu-ubuntu2204-base`
+  **Steps**:
+  - Create a v5litepod-4 spot TPU VM:
+    - `$env:CLOUDSDK_CORE_DISABLE_PROMPTS="1"`
+    - `$TPU_NAME = "sglang-jax-v5litepod-4-openai-spot-" + (Get-Date -Format "yyyyMMdd-HHmmss"); $ZONE="europe-west4-b"`
+    - `gcloud compute tpus tpu-vm create $TPU_NAME --zone=$ZONE --accelerator-type=v5litepod-4 --version=tpu-ubuntu2204-base --spot --quiet`
+    - `$IP = gcloud compute tpus tpu-vm describe $TPU_NAME --zone=$ZONE --format='value(networkEndpoints[0].accessConfig.externalIp)'`
+  - Install conda + create `sglang-jax` env:
+    - `ssh -i $HOME\.ssh\google_compute_engine -o StrictHostKeyChecking=no root@$IP "set -euo pipefail; if [ ! -d /root/miniconda3 ]; then curl -fsSL -o /root/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh; bash /root/miniconda.sh -b -p /root/miniconda3; rm -f /root/miniconda.sh; fi; source /root/miniconda3/etc/profile.d/conda.sh; conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main || true; conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r || true; if [ ! -d /root/miniconda3/envs/sglang-jax ]; then conda create -y -n sglang-jax python=3.12; fi; conda activate sglang-jax; python --version; pip install -U pip"`
+  - Clone sglang-jax + install:
+    - `ssh -i $HOME\.ssh\google_compute_engine -o StrictHostKeyChecking=no root@$IP "set -euo pipefail; mkdir -p /root/test_sglang_jax; if [ ! -d /root/test_sglang_jax/sglang-jax/.git ]; then git clone https://github.com/sgl-project/sglang-jax.git /root/test_sglang_jax/sglang-jax; fi; source /root/miniconda3/etc/profile.d/conda.sh; conda activate sglang-jax; cd /root/test_sglang_jax/sglang-jax; pip install -e 'python[all]'"`
+  - Sync plugin code:
+    - `ssh -i $HOME\.ssh\google_compute_engine -o StrictHostKeyChecking=no root@$IP "set -euo pipefail; mkdir -p /root/test_sglang_jax/plugins/sglang_jax"`
+    - `scp -i $HOME\.ssh\google_compute_engine -o StrictHostKeyChecking=no plugins/__init__.py root@${IP}:/root/test_sglang_jax/plugins/__init__.py`
+    - `scp -i $HOME\.ssh\google_compute_engine -o StrictHostKeyChecking=no plugins/sglang_jax/__init__.py root@${IP}:/root/test_sglang_jax/plugins/sglang_jax/__init__.py`
+    - `scp -i $HOME\.ssh\google_compute_engine -o StrictHostKeyChecking=no plugins/sglang_jax/run_multi_openai_servers.py root@${IP}:/root/test_sglang_jax/plugins/sglang_jax/run_multi_openai_servers.py`
+  - (Optional) verify JAX sees 4 TPU devices:
+    - `ssh -i $HOME\.ssh\google_compute_engine -o StrictHostKeyChecking=no root@$IP "set -euo pipefail; source /root/miniconda3/etc/profile.d/conda.sh; conda activate sglang-jax; python - <<'PY'\nimport jax\nprint('default_backend', jax.default_backend())\nprint('device_count', jax.device_count())\nprint('devices', jax.devices())\nPY"`
+  - Run 4 OpenAI-compatible servers (single process, one TPU device each) and send concurrent requests:
+    - `ssh -i $HOME\.ssh\google_compute_engine -o StrictHostKeyChecking=no root@$IP "set -euo pipefail; rm -f /tmp/libtpu_lockfile || true; source /root/miniconda3/etc/profile.d/conda.sh; conda activate sglang-jax; cd /root/test_sglang_jax; export JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache_openai_multi; mkdir -p /tmp/jit_cache_openai_multi; python -u -m plugins.sglang_jax.run_multi_openai_servers --model hf-internal-testing/tiny-random-LlamaForCausalLM --num-servers 4 --base-port 31000 --load-format dummy --context-length 128 --max-total-tokens 128 --max-prefill-tokens 128 --page-size 8 --max-running-requests 1 --prompt '1+1=?' --max-new-tokens 1 --request-timeout 300 --force-exit 2>&1 | tee /tmp/multi_openai_servers_4ports.log"`
+    - `ssh -i $HOME\.ssh\google_compute_engine -o StrictHostKeyChecking=no root@$IP "grep -n 'READY\\|DONE\\|RESP' /tmp/multi_openai_servers_4ports.log || true"`
+  **Expected Result**: `/tmp/multi_openai_servers_4ports.log` shows `READY` with ports `[31000-31003]`, four `RESP` lines with status `200`, and `DONE: servers=4 ...`.
+  **Troubleshooting**:
+  - `gcloud compute tpus tpu-vm ssh` can hang on Windows due to PuTTY host-key prompts; use OpenSSH (`ssh`/`scp`) against the VM external IP.
+  - If `v4-8` spot gets `PREEMPTED` quickly or on-demand has no capacity, use `v5litepod-4` in `europe-west4-b` as a 4-device fallback.

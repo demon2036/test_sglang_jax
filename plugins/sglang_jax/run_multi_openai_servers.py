@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import sys
@@ -21,6 +22,12 @@ if SGLANG_JAX_PYTHON.exists() and str(SGLANG_JAX_PYTHON) not in sys.path:
 
 from fastapi import FastAPI, Request
 from fastapi.responses import ORJSONResponse, Response
+from plugins.sglang_jax.weight_hot_update import (
+    add_noise_to_model_state_leaves,
+    async_flush_cache_best_effort,
+    async_pause_generation_best_effort,
+    compute_model_state_checksum,
+)
 from sgl_jax.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     CompletionRequest,
@@ -40,6 +47,7 @@ class ServerThread:
     thread: threading.Thread | None
     engine: Any | None
     server: Any | None
+    app: Any | None
 
 
 def _patch_zero_penalty_cache() -> None:
@@ -142,6 +150,39 @@ def _patch_engine_signal_handlers() -> None:
     engine_mod._sglang_jax_engine_signal_patched = True
 
 
+def _patch_disable_distributed_memory_probe() -> None:
+    """Avoid multi-host collectives during startup.
+
+    In multi-host TPU pods, calling `get_available_device_memory(..., distributed=True)`
+    triggers a global pmin across all devices, which is fragile when we are
+    starting multiple independent engines per host.
+    """
+    try:
+        import jax
+    except Exception:
+        return
+
+    if int(getattr(jax, "process_count", lambda: 1)()) <= 1:
+        return
+
+    from sgl_jax.srt.utils import jax_utils
+    from sgl_jax.srt.model_executor import model_runner as model_runner_mod
+
+    if getattr(jax_utils, "_sglang_jax_disable_distributed_mem_patched", False):
+        return
+
+    original = jax_utils.get_available_device_memory
+    original_imported = getattr(model_runner_mod, "get_available_device_memory", None)
+
+    def _patched_get_available_device_memory(device, distributed=False, empty_cache=True):
+        return original(device, distributed=False, empty_cache=empty_cache)
+
+    jax_utils.get_available_device_memory = _patched_get_available_device_memory  # type: ignore[assignment]
+    if callable(original_imported):
+        model_runner_mod.get_available_device_memory = _patched_get_available_device_memory  # type: ignore[assignment]
+    jax_utils._sglang_jax_disable_distributed_mem_patched = True
+
+
 def _parse_int_list(value: str) -> list[int]:
     items = []
     for part in value.split(","):
@@ -181,6 +222,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--keep-running", action="store_true", help="Leave servers running after validation.")
     parser.add_argument("--force-exit", action="store_true", help="Force exit after validation to avoid hanging threads.")
+    parser.add_argument(
+        "--enable-weight-reload",
+        action="store_true",
+        help="Expose /admin/* endpoints to reload or perturb weights without stopping the HTTP server.",
+    )
+    parser.add_argument(
+        "--no-multihost-lockstep",
+        action="store_true",
+        help="Disable multi-host lockstep barriers (not recommended for TPU pods).",
+    )
     return parser.parse_args()
 
 
@@ -276,7 +327,7 @@ def _send_chat_request(
     }
 
 
-def _build_fastapi_app(engine, api_key: str):
+def _build_fastapi_app(engine, api_key: str, *, enable_weight_reload: bool):
     app = FastAPI(openapi_url=None)
     if api_key:
         add_api_key_middleware(app, api_key)
@@ -308,10 +359,219 @@ def _build_fastapi_app(engine, api_key: str):
         ]
         return ModelList(data=model_cards)
 
+    if enable_weight_reload:
+        reload_lock = asyncio.Lock()
+        reload_state: dict[str, Any] = {
+            "reloading": False,
+            "last_ok": None,
+            "last_error": None,
+        }
+
+        @app.middleware("http")
+        async def block_during_reload(request: Request, call_next):
+            if (
+                reload_state["reloading"]
+                and request.url.path
+                not in (
+                    "/health",
+                    "/admin/reload_status",
+                    "/admin/reload_weights",
+                    "/admin/weights_checksum",
+                    "/admin/perturb_weights",
+                )
+            ):
+                return Response(status_code=503)
+            return await call_next(request)
+
+        @app.get("/admin/reload_status", response_class=ORJSONResponse)
+        async def reload_status():
+            return reload_state
+
+        @app.get("/admin/weights_checksum", response_class=ORJSONResponse)
+        async def weights_checksum():
+            try:
+                return {"ok": True, "checksum": compute_model_state_checksum(engine)}
+            except Exception as exc:
+                return ORJSONResponse(
+                    status_code=500,
+                    content={"ok": False, "error": str(exc)},
+                )
+
+        @app.post("/admin/perturb_weights", response_class=ORJSONResponse)
+        async def perturb_weights(raw_request: Request):
+            body = await raw_request.json()
+            seed = int(body.get("seed", 0))
+            scale = float(body.get("scale", 1e-3))
+            num_leaves = body.get("num_leaves", None)
+            if num_leaves is not None:
+                num_leaves = int(num_leaves)
+
+            async with reload_lock:
+                reload_state["reloading"] = True
+                reload_state["last_error"] = None
+                start = time.time()
+                try:
+                    await async_pause_generation_best_effort(engine)
+                    await async_flush_cache_best_effort(engine)
+                    checksum_before = compute_model_state_checksum(engine)
+                    perturbed = add_noise_to_model_state_leaves(
+                        engine,
+                        seed=seed,
+                        scale=scale,
+                        num_leaves=num_leaves,
+                    )
+                    await async_flush_cache_best_effort(engine)
+                    checksum_after = compute_model_state_checksum(engine)
+                    elapsed = time.time() - start
+                    reload_state["last_ok"] = {
+                        "time": time.time(),
+                        "elapsed_sec": elapsed,
+                        "model_path": "in_memory_noise",
+                        "leaf_count": perturbed,
+                    }
+                    return {
+                        "ok": True,
+                        "elapsed_sec": elapsed,
+                        "num_leaves": perturbed,
+                        "checksum_before": checksum_before,
+                        "checksum_after": checksum_after,
+                        "checksum_delta": checksum_after - checksum_before,
+                    }
+                except Exception as exc:
+                    reload_state["last_error"] = str(exc)
+                    return ORJSONResponse(
+                        status_code=500,
+                        content={"ok": False, "error": str(exc)},
+                    )
+                finally:
+                    reload_state["reloading"] = False
+
+        @app.post("/admin/reload_weights", response_class=ORJSONResponse)
+        async def reload_weights(raw_request: Request):
+            body = await raw_request.json()
+            model_path = (body.get("model_path") or "").strip()
+            revision = (body.get("revision") or None)
+            load_format = (body.get("load_format") or "").strip()
+            if not model_path:
+                return ORJSONResponse(status_code=400, content={"ok": False, "error": "model_path is required"})
+
+            async with reload_lock:
+                reload_state["reloading"] = True
+                reload_state["last_error"] = None
+                start = time.time()
+                resolved_path = model_path
+                try:
+                    try:
+                        await engine.async_pause_generation(mode="abort")
+                    except Exception:
+                        pass
+                    try:
+                        await engine.async_flush_cache()
+                    except Exception:
+                        pass
+
+                    if not os.path.isdir(resolved_path):
+                        try:
+                            from huggingface_hub import snapshot_download
+                        except ImportError as exc:
+                            raise RuntimeError(
+                                "huggingface_hub is required to resolve non-local model_path"
+                            ) from exc
+                        resolved_path = snapshot_download(
+                            repo_id=model_path,
+                            revision=revision,
+                            local_dir_use_symlinks=False,
+                            cache_dir=os.environ.get("HF_HOME") or None,
+                            resume_download=True,
+                        )
+
+                    model_runner = engine.scheduler_info["scheduler"].tp_worker.worker.model_runner
+                    model_config = model_runner.model_config
+                    model_config.model_path = resolved_path
+                    if revision is not None:
+                        model_config.revision = revision
+
+                    if load_format:
+                        if load_format == "dummy":
+                            model_config._dummy_mode = True
+                        else:
+                            model_config._dummy_mode = False
+
+                    try:
+                        from flax import nnx
+                        import jax
+                    except ImportError as exc:
+                        raise RuntimeError("jax+flax are required for weight reload") from exc
+
+                    with jax.set_mesh(model_runner.mesh):
+                        model_runner.model.load_weights(model_config)
+                    _, model_state = nnx.split(model_runner.model)
+                    model_runner.model_state_leaves, _ = jax.tree_util.tree_flatten(model_state)
+
+                    try:
+                        await engine.async_flush_cache()
+                    except Exception:
+                        pass
+
+                    elapsed = time.time() - start
+                    reload_state["last_ok"] = {
+                        "time": time.time(),
+                        "elapsed_sec": elapsed,
+                        "model_path": resolved_path,
+                    }
+                    return {"ok": True, "model_path": resolved_path, "elapsed_sec": elapsed}
+                except Exception as exc:
+                    reload_state["last_error"] = str(exc)
+                    return ORJSONResponse(status_code=500, content={"ok": False, "error": str(exc)})
+                finally:
+                    reload_state["reloading"] = False
+
     return app
 
 
-def _run_server_thread(state: ServerThread, args: argparse.Namespace) -> None:
+def _multihost_lockstep_enabled(args: argparse.Namespace) -> bool:
+    if bool(getattr(args, "no_multihost_lockstep", False)):
+        return False
+    try:
+        import jax
+    except Exception:
+        return False
+    try:
+        process_count = int(getattr(jax, "process_count", lambda: 1)())
+    except Exception:
+        process_count = 1
+    if process_count <= 1:
+        return False
+    return int(getattr(args, "num_servers", 1)) > 1
+
+
+def _sync_multihost_best_effort(label: str) -> None:
+    try:
+        import jax
+        from jax.experimental import multihost_utils
+    except Exception:
+        return
+    try:
+        if int(getattr(jax, "process_count", lambda: 1)()) <= 1:
+            return
+    except Exception:
+        return
+
+    barrier = getattr(multihost_utils, "sync_global_devices", None)
+    if callable(barrier):
+        try:
+            barrier(label)
+        except TypeError:
+            barrier()
+        return
+
+    try:
+        multihost_utils.broadcast_one_to_all(label)
+    except Exception:
+        pass
+
+
+def _build_server(state: ServerThread, args: argparse.Namespace) -> None:
     from sgl_jax.srt.entrypoints.engine import Engine
     from sgl_jax.srt.server_args import ServerArgs
     import uvicorn
@@ -335,7 +595,7 @@ def _run_server_thread(state: ServerThread, args: argparse.Namespace) -> None:
     )
 
     engine = Engine(server_args=server_args)
-    app = _build_fastapi_app(engine, args.api_key)
+    app = _build_fastapi_app(engine, args.api_key, enable_weight_reload=args.enable_weight_reload)
 
     config = uvicorn.Config(
         app,
@@ -347,7 +607,14 @@ def _run_server_thread(state: ServerThread, args: argparse.Namespace) -> None:
     server = uvicorn.Server(config)
 
     state.engine = engine
+    state.app = app
     state.server = server
+
+
+def _run_uvicorn_thread(state: ServerThread) -> None:
+    server = state.server
+    if server is None:
+        raise RuntimeError("server is not initialized")
     server.run()
 
 
@@ -375,20 +642,31 @@ def main() -> int:
 
     _patch_zero_penalty_cache()
     _patch_engine_signal_handlers()
+    _patch_disable_distributed_memory_probe()
 
     ports = _resolve_ports(args)
     device_indexes = _resolve_device_indexes(args)
 
     states: list[ServerThread] = []
     for idx, (port, device_index) in enumerate(zip(ports, device_indexes, strict=True)):
-        state = ServerThread(idx, port, device_index, None, None, None)
-        thread = threading.Thread(
-            target=_run_server_thread,
-            args=(state, args),
-            daemon=True,
-        )
-        state.thread = thread
+        state = ServerThread(idx, port, device_index, None, None, None, None)
         states.append(state)
+
+    lockstep = _multihost_lockstep_enabled(args)
+    if lockstep:
+        _sync_multihost_best_effort("sglang_jax_multi_openai:init")
+
+    for state in states:
+        _build_server(state, args)
+        if lockstep:
+            _sync_multihost_best_effort(f"sglang_jax_multi_openai:engine_{state.index}")
+
+    if lockstep:
+        _sync_multihost_best_effort("sglang_jax_multi_openai:servers")
+
+    for state in states:
+        thread = threading.Thread(target=_run_uvicorn_thread, args=(state,), daemon=True)
+        state.thread = thread
         thread.start()
 
     try:
@@ -439,9 +717,13 @@ def main() -> int:
 
         if args.keep_running:
             print("KEEP_RUNNING: leaving servers alive.", flush=True)
-            return 0
+            try:
+                while True:
+                    time.sleep(3600)
+            except KeyboardInterrupt:
+                return 0
     finally:
-        if not args.keep_running and not args.force_exit:
+        if not args.force_exit:
             _shutdown_servers(states)
 
     return 0
