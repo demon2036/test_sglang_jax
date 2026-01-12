@@ -31,3 +31,29 @@
   **Expected Result**: `AGENTS.md` states the plan-tool requirement and the no-confirmation fallback behavior
   **Troubleshooting**: N/A
   **References**: N/A
+
+- **Title**: SOP: Reorganize `docs/sops.md` for fast lookup (quick tasks + browse + grep recipes)
+  **Prereqs**: repo at `/home/john/test_sglang_jax`; `rg` available
+  **Steps**:
+  - Review current SOP inventory:
+    - `find docs/sops -maxdepth 1 -type f -name '*.md' -print`
+    - `wc -l docs/sops/*.md | sort -n`
+    - `sed -n '1,200p' docs/sops.md`
+  - Update the index structure in `docs/sops.md`:
+    - Add **Quick tasks (task-based)** as the top entry point
+    - Keep **Browse by area (component-based)** for the full list
+    - Add **Search recipes (grep-first)** for common queries
+  - Normalize any outlier SOP format (so grep recipes stay reliable):
+    - Ensure each SOP entry uses the standard fields: `- **Title**:`, `**Prereqs**:`, `**Steps**:`, `**Expected Result**:`, `**Troubleshooting**:`, `**References**:`
+    - Example: convert `docs/sops/git-pull-update.md` from `# SOP: ...` headings into the standard field-based format
+  - Sanity-check that the grep recipes work:
+    - `rg -n '^- \\*\\*Title\\*\\*:' docs/sops`
+    - `rg -n 'gcloud (alpha )?compute tpus tpu-vm' docs/sops`
+    - `rg -n 'SGLANG_JAX_MODEL=|--model' docs/sops`
+    - `rg -n 'TPU_NAME=|ZONE=|JAX_COMPILATION_CACHE_DIR' docs/sops`
+    - `rg -n '\\*\\*Prereqs\\*\\*:' docs/sops`
+    - `rg -n '\\*\\*Expected Result\\*\\*:' docs/sops`
+    - `rg -n '\\*\\*Troubleshooting\\*\\*:' docs/sops`
+  **Expected Result**: `docs/sops.md` supports (1) task-based lookup, (2) area browsing, and (3) grep-first discovery
+  **Troubleshooting**: If `rg` patterns match nothing, confirm SOP entries still use `- **Title**:`, and update the patterns accordingly
+  **References**: N/A
